@@ -9,6 +9,7 @@ require("dotenv").config();
 const pool = require("./db");
 const { matchWines } = require("./matching");
 const { winesToCSV, parseCSV, WINE_COLUMNS } = require("./csv");
+const { sendLeadEmail } = require("./mailer");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -41,13 +42,26 @@ app.get("/tenants/:slug/config", async (req, res) => {
   try {
     const { slug } = req.params;
     const result = await pool.query(
-      "SELECT slug, name, branding, features, quiz_config, content, pricing_tier FROM tenants WHERE slug = $1 AND active = true",
+      "SELECT slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources FROM tenants WHERE slug = $1 AND active = true",
       [slug]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Tenant nicht gefunden" });
     }
-    res.json(result.rows[0]);
+    const tenant = result.rows[0];
+
+    // Bei Demo-Tenants: Namen der auswählbaren Quell-Kunden mitschicken
+    if (tenant.pricing_tier === "demo" && tenant.demo_sources?.length > 0) {
+      const sources = await pool.query(
+        "SELECT slug, name FROM tenants WHERE slug = ANY($1) AND active = true ORDER BY name",
+        [tenant.demo_sources]
+      );
+      tenant.demo_options = sources.rows;
+    } else {
+      tenant.demo_options = [];
+    }
+
+    res.json(tenant);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Serverfehler" });
@@ -80,7 +94,13 @@ app.get("/tenants/:slug/wines", async (req, res) => {
 app.post("/tenants/:slug/quiz-result", async (req, res) => {
   try {
     const { slug } = req.params;
-    const answers = req.body;
+    const { sourceSlugs, sourceSlug, ...answers } = req.body;
+    // sourceSlugs (Array) ist der aktuelle Weg, sourceSlug (einzeln) bleibt aus Kompatibilität erhalten
+    const requestedSlugs = Array.isArray(sourceSlugs) && sourceSlugs.length > 0
+      ? sourceSlugs
+      : sourceSlug
+      ? [sourceSlug]
+      : [];
 
     const requiredFields = [
       "occasion",
@@ -98,17 +118,34 @@ app.post("/tenants/:slug/quiz-result", async (req, res) => {
     }
 
     const tenantResult = await pool.query(
-      "SELECT id FROM tenants WHERE slug = $1 AND active = true",
+      "SELECT id, pricing_tier, demo_sources FROM tenants WHERE slug = $1 AND active = true",
       [slug]
     );
     if (tenantResult.rows.length === 0) {
       return res.status(404).json({ error: "Tenant nicht gefunden" });
     }
-    const tenantId = tenantResult.rows[0].id;
+    const tenant = tenantResult.rows[0];
+    let wineTenantIds = [tenant.id];
+
+    // Demo-Tenants dürfen mit Erlaubnis (demo_sources) die Weine 1-n anderer Kunden kombinieren
+    if (requestedSlugs.length > 0 && tenant.pricing_tier === "demo") {
+      const invalid = requestedSlugs.filter((s) => !tenant.demo_sources?.includes(s));
+      if (invalid.length > 0) {
+        return res.status(403).json({ error: `Quelle(n) nicht freigegeben: ${invalid.join(", ")}` });
+      }
+      const sourceResult = await pool.query(
+        "SELECT id FROM tenants WHERE slug = ANY($1) AND active = true",
+        [requestedSlugs]
+      );
+      if (sourceResult.rows.length === 0) {
+        return res.status(404).json({ error: "Keine der Quellen gefunden" });
+      }
+      wineTenantIds = sourceResult.rows.map((r) => r.id);
+    }
 
     const winesResult = await pool.query(
-      "SELECT * FROM wines WHERE tenant_id = $1",
-      [tenantId]
+      "SELECT * FROM wines WHERE tenant_id = ANY($1)",
+      [wineTenantIds]
     );
 
     if (winesResult.rows.length === 0) {
@@ -122,10 +159,71 @@ app.post("/tenants/:slug/quiz-result", async (req, res) => {
     await pool.query(
       `INSERT INTO quiz_results (tenant_id, answers, recommended_wine_id)
        VALUES ($1, $2, $3)`,
-      [tenantId, answers, result.top ? result.top.id : null]
+      [tenant.id, answers, result.top ? result.top.id : null]
     );
 
     res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+const HIDDEN_LEAD_CAPTURE_TIERS = ["basis", "pilot"];
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Lead speichern (E-Mail-Formular auf der Ergebnisseite)
+app.post("/tenants/:slug/leads", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { email, wineId, answers, consent } = req.body;
+
+    if (!email || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: "Ungültige E-Mail-Adresse" });
+    }
+    if (!consent) {
+      return res.status(400).json({ error: "Einwilligung zur Kontaktaufnahme erforderlich" });
+    }
+
+    const tenantResult = await pool.query(
+      "SELECT id, name, pricing_tier, email_config, branding FROM tenants WHERE slug = $1 AND active = true",
+      [slug]
+    );
+    if (tenantResult.rows.length === 0) {
+      return res.status(404).json({ error: "Tenant nicht gefunden" });
+    }
+    const tenant = tenantResult.rows[0];
+
+    if (HIDDEN_LEAD_CAPTURE_TIERS.includes(tenant.pricing_tier)) {
+      return res.status(403).json({ error: "Lead-Erfassung für dieses Paket nicht verfügbar" });
+    }
+
+    await pool.query(
+      `INSERT INTO leads (tenant_id, email, wine_id, answers, consent)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [tenant.id, email, wineId || null, answers ? JSON.stringify(answers) : null, true]
+    );
+
+    // Mailversand ist optional aktivierbar (email_config.enabled) und blockiert
+    // die Lead-Speicherung nicht, falls er fehlschlägt - der Lead ist in dem
+    // Fall trotzdem im Admin-UI sichtbar.
+    if (tenant.email_config?.enabled && wineId) {
+      try {
+        const wineResult = await pool.query("SELECT * FROM wines WHERE id = $1", [wineId]);
+        if (wineResult.rows.length > 0) {
+          await sendLeadEmail({
+            tenant,
+            wine: wineResult.rows[0],
+            toEmail: email,
+            branding: tenant.branding,
+          });
+        }
+      } catch (mailErr) {
+        console.error("Mailversand fehlgeschlagen:", mailErr);
+      }
+    }
+
+    res.status(201).json({ email });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Serverfehler" });
@@ -275,10 +373,10 @@ app.get("/admin/tenants/:id", requireAdmin, async (req, res) => {
 
 app.post("/admin/tenants", requireAdmin, async (req, res) => {
   try {
-    const { slug, name, branding, features, quiz_config, content, pricing_tier } = req.body;
+    const { slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources } = req.body;
     const result = await pool.query(
-      `INSERT INTO tenants (slug, name, branding, features, quiz_config, content, pricing_tier)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      `INSERT INTO tenants (slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
       [
         slug,
         name,
@@ -287,6 +385,7 @@ app.post("/admin/tenants", requireAdmin, async (req, res) => {
         JSON.stringify(quiz_config || DEFAULT_QUIZ_CONFIG),
         JSON.stringify(content || {}),
         pricing_tier || "basis",
+        JSON.stringify(demo_sources || []),
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -302,7 +401,7 @@ app.post("/admin/tenants", requireAdmin, async (req, res) => {
 app.patch("/admin/tenants/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, branding, features, active, quiz_config, content, pricing_tier } = req.body;
+    const { name, branding, features, active, quiz_config, content, pricing_tier, demo_sources, email_config } = req.body;
     const result = await pool.query(
       `UPDATE tenants SET
         name = COALESCE($1, name),
@@ -311,8 +410,10 @@ app.patch("/admin/tenants/:id", requireAdmin, async (req, res) => {
         active = COALESCE($4, active),
         quiz_config = COALESCE($5, quiz_config),
         content = COALESCE($6, content),
-        pricing_tier = COALESCE($7, pricing_tier)
-       WHERE id = $8 RETURNING *`,
+        pricing_tier = COALESCE($7, pricing_tier),
+        demo_sources = COALESCE($8, demo_sources),
+        email_config = COALESCE($9, email_config)
+       WHERE id = $10 RETURNING *`,
       [
         name,
         branding ? JSON.stringify(branding) : null,
@@ -321,6 +422,8 @@ app.patch("/admin/tenants/:id", requireAdmin, async (req, res) => {
         quiz_config ? JSON.stringify(quiz_config) : null,
         content ? JSON.stringify(content) : null,
         pricing_tier || null,
+        demo_sources ? JSON.stringify(demo_sources) : null,
+        email_config ? JSON.stringify(email_config) : null,
         id,
       ]
     );
@@ -431,6 +534,17 @@ app.delete("/admin/wines/:id", requireAdmin, async (req, res) => {
   }
 });
 
+app.delete("/admin/tenants/:id/wines", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query("DELETE FROM wines WHERE tenant_id = $1", [id]);
+    res.json({ deleted: result.rowCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
 /* ---------- Admin: CSV Import/Export ---------- */
 
 app.get("/admin/tenants/:id/wines/export", requireAdmin, async (req, res) => {
@@ -493,6 +607,53 @@ app.post("/admin/tenants/:id/wines/import", requireAdmin, async (req, res) => {
     }
 
     res.json({ imported, failed, errors });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+/* ---------- Admin: Leads ---------- */
+
+app.get("/admin/tenants/:id/leads", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT l.id, l.email, l.created_at, w.name AS wine_name
+       FROM leads l
+       LEFT JOIN wines w ON w.id = l.wine_id
+       WHERE l.tenant_id = $1
+       ORDER BY l.created_at DESC`,
+      [id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+app.get("/admin/tenants/:id/leads/export", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT l.email, l.created_at, w.name AS wine_name
+       FROM leads l
+       LEFT JOIN wines w ON w.id = l.wine_id
+       WHERE l.tenant_id = $1
+       ORDER BY l.created_at DESC`,
+      [id]
+    );
+    const header = "email,empfohlener_wein,datum";
+    const lines = result.rows.map((r) => {
+      const date = new Date(r.created_at).toISOString();
+      const wine = (r.wine_name || "").replace(/,/g, ";");
+      return `${r.email},${wine},${date}`;
+    });
+    const csv = [header, ...lines].join("\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="leads.csv"');
+    res.send(csv);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Serverfehler" });
