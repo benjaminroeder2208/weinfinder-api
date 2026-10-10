@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
@@ -9,7 +10,7 @@ require("dotenv").config();
 const pool = require("./db");
 const { matchWines } = require("./matching");
 const { winesToCSV, parseCSV, WINE_COLUMNS } = require("./csv");
-const { sendLeadEmail } = require("./mailer");
+const { sendLeadEmail, sendConfirmationEmail } = require("./mailer");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -42,7 +43,7 @@ app.get("/tenants/:slug/config", async (req, res) => {
   try {
     const { slug } = req.params;
     const result = await pool.query(
-      "SELECT slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources FROM tenants WHERE slug = $1 AND active = true",
+      "SELECT slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources, legal_config, email_config FROM tenants WHERE slug = $1 AND active = true",
       [slug]
     );
     if (result.rows.length === 0) {
@@ -62,6 +63,19 @@ app.get("/tenants/:slug/config", async (req, res) => {
     }
 
     res.json(tenant);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+// Betreiberdaten für die Datenschutzseite - öffentlich, keine sensiblen Daten
+app.get("/platform-settings", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT operator_name, operator_address, operator_contact_email FROM platform_settings WHERE id = 1"
+    );
+    res.json(result.rows[0] || {});
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Serverfehler" });
@@ -198,32 +212,135 @@ app.post("/tenants/:slug/leads", async (req, res) => {
       return res.status(403).json({ error: "Lead-Erfassung für dieses Paket nicht verfügbar" });
     }
 
+    const token = crypto.randomBytes(24).toString("hex");
+    const mailEnabled = Boolean(tenant.email_config?.enabled);
+
     await pool.query(
-      `INSERT INTO leads (tenant_id, email, wine_id, answers, consent)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [tenant.id, email, wineId || null, answers ? JSON.stringify(answers) : null, true]
+      `INSERT INTO leads (tenant_id, email, wine_id, answers, consent, token, confirmed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        tenant.id,
+        email,
+        wineId || null,
+        answers ? JSON.stringify(answers) : null,
+        true,
+        token,
+        !mailEnabled, // ohne Mailversand gibt es nichts zu bestätigen
+      ]
     );
 
-    // Mailversand ist optional aktivierbar (email_config.enabled) und blockiert
-    // die Lead-Speicherung nicht, falls er fehlschlägt - der Lead ist in dem
-    // Fall trotzdem im Admin-UI sichtbar.
-    if (tenant.email_config?.enabled && wineId) {
+    // Double-Opt-In: Zuerst nur eine Bestätigungsmail. Die eigentliche
+    // Empfehlungsmail (inkl. Abmeldelink) geht erst nach Klick auf den
+    // Bestätigungslink raus (siehe GET /leads/confirm/:token).
+    if (mailEnabled) {
       try {
-        const wineResult = await pool.query("SELECT * FROM wines WHERE id = $1", [wineId]);
-        if (wineResult.rows.length > 0) {
-          await sendLeadEmail({
-            tenant,
-            wine: wineResult.rows[0],
-            toEmail: email,
-            branding: tenant.branding,
-          });
-        }
+        const confirmUrl = `https://app.premium-weinfinder.de/confirm/${token}`;
+        await sendConfirmationEmail({ tenant, toEmail: email, confirmUrl });
       } catch (mailErr) {
-        console.error("Mailversand fehlgeschlagen:", mailErr);
+        console.error("Bestätigungsmail fehlgeschlagen:", mailErr);
       }
     }
 
     res.status(201).json({ email });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+// Double-Opt-In: Bestätigung per Klick löst die eigentliche Empfehlungsmail aus
+app.get("/leads/confirm/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    const leadResult = await pool.query(
+      `SELECT l.*, t.name AS tenant_name, t.branding, t.email_config
+       FROM leads l JOIN tenants t ON t.id = l.tenant_id
+       WHERE l.token = $1`,
+      [token]
+    );
+    if (leadResult.rows.length === 0) {
+      return res.status(404).json({ error: "Bestätigungslink ungültig oder abgelaufen" });
+    }
+    const lead = leadResult.rows[0];
+
+    if (lead.unsubscribed) {
+      return res.status(410).json({ error: "Diese Anfrage wurde bereits abgemeldet" });
+    }
+
+    if (!lead.confirmed) {
+      await pool.query(
+        "UPDATE leads SET confirmed = true, confirmed_at = now() WHERE id = $1",
+        [lead.id]
+      );
+
+      if (lead.wine_id) {
+        const wineResult = await pool.query("SELECT * FROM wines WHERE id = $1", [lead.wine_id]);
+        if (wineResult.rows.length > 0) {
+          const unsubscribeUrl = `https://app.premium-weinfinder.de/unsubscribe/${token}`;
+          try {
+            await sendLeadEmail({
+              tenant: { name: lead.tenant_name, email_config: lead.email_config },
+              wine: wineResult.rows[0],
+              toEmail: lead.email,
+              branding: lead.branding,
+              unsubscribeUrl,
+            });
+          } catch (mailErr) {
+            console.error("Empfehlungsmail fehlgeschlagen:", mailErr);
+          }
+        }
+      }
+    }
+
+    res.json({ confirmed: true, email: lead.email, tenantName: lead.tenant_name });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+// Opt-Out: Abmeldelink am Ende jeder Mail
+app.get("/leads/unsubscribe/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    const result = await pool.query(
+      "UPDATE leads SET unsubscribed = true, unsubscribed_at = now() WHERE token = $1 RETURNING email",
+      [token]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Link ungültig" });
+    }
+    res.json({ unsubscribed: true, email: result.rows[0].email });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+/* ---------- Admin: Plattform-Einstellungen (Betreiberdaten) ---------- */
+
+app.get("/admin/settings", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM platform_settings WHERE id = 1");
+    res.json(result.rows[0] || {});
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+app.patch("/admin/settings", requireAdmin, async (req, res) => {
+  try {
+    const { operator_name, operator_address, operator_contact_email } = req.body;
+    const result = await pool.query(
+      `UPDATE platform_settings SET
+        operator_name = COALESCE($1, operator_name),
+        operator_address = COALESCE($2, operator_address),
+        operator_contact_email = COALESCE($3, operator_contact_email)
+       WHERE id = 1 RETURNING *`,
+      [operator_name, operator_address, operator_contact_email]
+    );
+    res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Serverfehler" });
@@ -291,6 +408,16 @@ app.get("/admin/tenants", requireAdmin, async (req, res) => {
 /* ---------- Schema-Hinweis ----------
    Erfordert einmalig:
    ALTER TABLE tenants ADD COLUMN content JSONB NOT NULL DEFAULT '{}';
+   ALTER TABLE tenants ADD COLUMN legal_config JSONB NOT NULL DEFAULT '{"retentionMonths": 6}';
+
+   CREATE TABLE platform_settings (
+       id INT PRIMARY KEY DEFAULT 1,
+       operator_name TEXT NOT NULL DEFAULT '',
+       operator_address TEXT NOT NULL DEFAULT '',
+       operator_contact_email TEXT NOT NULL DEFAULT '',
+       CONSTRAINT single_row CHECK (id = 1)
+   );
+   INSERT INTO platform_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
 ------------------------------------- */
 
 const DEFAULT_QUIZ_CONFIG = [
@@ -373,10 +500,10 @@ app.get("/admin/tenants/:id", requireAdmin, async (req, res) => {
 
 app.post("/admin/tenants", requireAdmin, async (req, res) => {
   try {
-    const { slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources } = req.body;
+    const { slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources, legal_config } = req.body;
     const result = await pool.query(
-      `INSERT INTO tenants (slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      `INSERT INTO tenants (slug, name, branding, features, quiz_config, content, pricing_tier, demo_sources, legal_config)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
       [
         slug,
         name,
@@ -386,6 +513,7 @@ app.post("/admin/tenants", requireAdmin, async (req, res) => {
         JSON.stringify(content || {}),
         pricing_tier || "basis",
         JSON.stringify(demo_sources || []),
+        JSON.stringify(legal_config || { retentionMonths: 6 }),
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -401,7 +529,7 @@ app.post("/admin/tenants", requireAdmin, async (req, res) => {
 app.patch("/admin/tenants/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, branding, features, active, quiz_config, content, pricing_tier, demo_sources, email_config } = req.body;
+    const { name, branding, features, active, quiz_config, content, pricing_tier, demo_sources, email_config, legal_config } = req.body;
     const result = await pool.query(
       `UPDATE tenants SET
         name = COALESCE($1, name),
@@ -412,8 +540,9 @@ app.patch("/admin/tenants/:id", requireAdmin, async (req, res) => {
         content = COALESCE($6, content),
         pricing_tier = COALESCE($7, pricing_tier),
         demo_sources = COALESCE($8, demo_sources),
-        email_config = COALESCE($9, email_config)
-       WHERE id = $10 RETURNING *`,
+        email_config = COALESCE($9, email_config),
+        legal_config = COALESCE($10, legal_config)
+       WHERE id = $11 RETURNING *`,
       [
         name,
         branding ? JSON.stringify(branding) : null,
@@ -424,6 +553,7 @@ app.patch("/admin/tenants/:id", requireAdmin, async (req, res) => {
         pricing_tier || null,
         demo_sources ? JSON.stringify(demo_sources) : null,
         email_config ? JSON.stringify(email_config) : null,
+        legal_config ? JSON.stringify(legal_config) : null,
         id,
       ]
     );
@@ -619,7 +749,7 @@ app.get("/admin/tenants/:id/leads", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
-      `SELECT l.id, l.email, l.created_at, w.name AS wine_name
+      `SELECT l.id, l.email, l.created_at, l.confirmed, l.confirmed_at, l.unsubscribed, w.name AS wine_name
        FROM leads l
        LEFT JOIN wines w ON w.id = l.wine_id
        WHERE l.tenant_id = $1
@@ -637,23 +767,45 @@ app.get("/admin/tenants/:id/leads/export", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
-      `SELECT l.email, l.created_at, w.name AS wine_name
+      `SELECT l.email, l.created_at, l.confirmed, l.unsubscribed, w.name AS wine_name
        FROM leads l
        LEFT JOIN wines w ON w.id = l.wine_id
        WHERE l.tenant_id = $1
        ORDER BY l.created_at DESC`,
       [id]
     );
-    const header = "email,empfohlener_wein,datum";
+    const header = "email,empfohlener_wein,bestaetigt,abgemeldet,datum";
     const lines = result.rows.map((r) => {
       const date = new Date(r.created_at).toISOString();
       const wine = (r.wine_name || "").replace(/,/g, ";");
-      return `${r.email},${wine},${date}`;
+      return `${r.email},${wine},${r.confirmed},${r.unsubscribed},${date}`;
     });
     const csv = [header, ...lines].join("\n");
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", 'attachment; filename="leads.csv"');
     res.send(csv);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+app.delete("/admin/leads/:id", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM leads WHERE id = $1", [id]);
+    res.status(204).send();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+app.delete("/admin/tenants/:id/leads", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query("DELETE FROM leads WHERE tenant_id = $1", [id]);
+    res.json({ deleted: result.rowCount });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Serverfehler" });

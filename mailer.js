@@ -1,23 +1,18 @@
 const nodemailer = require("nodemailer");
 
-const SENDER_DOMAIN = "service.premium-weinfinder.de";
-
-// Sendet über den lokalen Postfix (wie beim Intervall Coach) - kein externer
-// Dienst nötig. Host/Port sind über .env überschreibbar, falls sich das
-// Postfix-Setup mal ändert.
+// Nutzt dasselbe Strato-Mail-Muster wie beim Intervall Coach: ein festes,
+// authentifiziertes Postfach. Personalisiert wird nur der Anzeigename,
+// nicht die technische Absenderadresse (Strato lässt sonst nichts anderes
+// als die authentifizierte Adresse als Envelope-From zu).
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "localhost",
-  port: process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT, 10) : 25,
-  secure: false,
-  tls: { rejectUnauthorized: false },
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT || "465", 10),
+  secure: true, // Port 465 = implizites TLS
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
 });
-
-// Nur Kleinbuchstaben, Zahlen, Punkt und Bindestrich - verhindert Header-
-// Injection über das frei konfigurierbare Feld "Absendername".
-function sanitizeSenderName(name) {
-  const clean = (name || "weinfinder").toLowerCase().replace(/[^a-z0-9.-]/g, "");
-  return clean || "weinfinder";
-}
 
 function escapeHtml(str) {
   return String(str || "")
@@ -26,7 +21,7 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;");
 }
 
-function buildLeadEmailHtml({ tenant, wine, branding }) {
+function buildLeadEmailHtml({ tenant, wine, branding, unsubscribeUrl }) {
   const accent = branding?.primaryColor || "#a0bd00";
   const bg = branding?.backgroundColor || "#1c1612";
   const text = branding?.textColor || "#f2ede8";
@@ -57,25 +52,72 @@ function buildLeadEmailHtml({ tenant, wine, branding }) {
       </div>
       <p style="color:${text}; opacity:0.6; font-size:0.75rem; text-align:center; margin-top:24px;">
         Diese E-Mail wurde von ${escapeHtml(tenant.name)} über Weinfinder verschickt,
-        weil du auf dessen Website eine Weinempfehlung angefragt hast.
+        weil du auf dessen Website eine Weinempfehlung angefragt und bestätigt hast.
+      </p>
+      ${
+        unsubscribeUrl
+          ? `<p style="text-align:center; margin-top:8px;">
+               <a href="${escapeHtml(unsubscribeUrl)}" style="color:${text}; opacity:0.5; font-size:0.7rem;">
+                 Keine weiteren E-Mails erhalten
+               </a>
+             </p>`
+          : ""
+      }
+    </div>
+  </div>`;
+}
+
+function buildConfirmationEmailHtml({ tenant, confirmUrl }) {
+  return `
+  <div style="background:#1c1612; padding:32px 16px; font-family:Georgia, serif;">
+    <div style="max-width:480px; margin:0 auto; text-align:center;">
+      <h1 style="color:#f2ede8; font-size:1.3rem; margin-bottom:16px;">
+        Fast geschafft!
+      </h1>
+      <p style="color:#a89e94; margin-bottom:24px;">
+        Bitte bestätige deine E-Mail-Adresse, damit ${escapeHtml(tenant.name)}
+        dir deine Weinempfehlung zusenden kann.
+      </p>
+      <a href="${escapeHtml(confirmUrl)}" style="display:inline-block; background:#a0bd00; color:#1c1612; padding:12px 28px; border-radius:8px; text-decoration:none; font-weight:bold;">
+        E-Mail-Adresse bestätigen
+      </a>
+      <p style="color:#a89e94; opacity:0.6; font-size:0.75rem; margin-top:24px;">
+        Falls du diese Anfrage nicht gestellt hast, kannst du diese E-Mail einfach ignorieren.
       </p>
     </div>
   </div>`;
 }
 
-async function sendLeadEmail({ tenant, wine, toEmail, branding }) {
-  const senderName = sanitizeSenderName(tenant.email_config?.senderName);
-  const fromAddress = `${senderName}@${SENDER_DOMAIN}`;
+async function sendLeadEmail({ tenant, wine, toEmail, branding, unsubscribeUrl }) {
+  const displayName = tenant.email_config?.displayName || tenant.name;
   const replyTo = tenant.email_config?.replyTo || undefined;
 
   await transporter.sendMail({
-    from: `"${tenant.name}" <${fromAddress}>`,
+    from: {
+      name: displayName,
+      address: process.env.SMTP_FROM_ADDRESS || process.env.SMTP_USER,
+    },
     to: toEmail,
     replyTo,
     subject: `Deine Weinempfehlung: ${wine.name}`,
-    html: buildLeadEmailHtml({ tenant, wine, branding }),
-    text: `Deine Weinempfehlung von ${tenant.name}: ${wine.name} - ${parseFloat(wine.price).toFixed(2)} €\n${wine.link || ""}`,
+    html: buildLeadEmailHtml({ tenant, wine, branding, unsubscribeUrl }),
+    text: `Deine Weinempfehlung von ${tenant.name}: ${wine.name} - ${parseFloat(wine.price).toFixed(2)} €\n${wine.link || ""}${unsubscribeUrl ? `\n\nAbmelden: ${unsubscribeUrl}` : ""}`,
   });
 }
 
-module.exports = { sendLeadEmail };
+async function sendConfirmationEmail({ tenant, toEmail, confirmUrl }) {
+  const displayName = tenant.email_config?.displayName || tenant.name;
+
+  await transporter.sendMail({
+    from: {
+      name: displayName,
+      address: process.env.SMTP_FROM_ADDRESS || process.env.SMTP_USER,
+    },
+    to: toEmail,
+    subject: `Bitte bestätige deine E-Mail-Adresse (${tenant.name})`,
+    html: buildConfirmationEmailHtml({ tenant, confirmUrl }),
+    text: `Bitte bestätige deine E-Mail-Adresse, damit ${tenant.name} dir deine Weinempfehlung zusenden kann: ${confirmUrl}`,
+  });
+}
+
+module.exports = { sendLeadEmail, sendConfirmationEmail };
